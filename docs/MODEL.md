@@ -41,13 +41,26 @@ erDiagram
     RUN ||--o{ PR_DAILY : produced
 ```
 
+```mermaid
+flowchart LR
+    HW[Huawei FusionSolar API] --> C[consumer v2] --> IF[(Influx NEO_LIVE)]
+    CFG[(PR configuration<br/>pr_live_neodb)]
+    subgraph svc [neo-model service, every 5 min]
+        AS[asset sync]
+        IN[L1 ingest]
+        CI["calc.compute_intervals()"]
+        CD["calc.compute_daily()"]
+    end
+    CFG --> AS --> ASSET[(asset.*)]
+    IF --> IN --> TS[(ts.* L1)]
+    TS --> CI --> PI[(calc.pr_interval L2)]
+    PI --> CD --> PD[(calc.pr_daily L2)]
+    ASSET -.-> CI
+    ASSET -.-> CD
+    TS --> TJ[Timescale jobs] --> RPT[(rpt.* L3 aggregates)]
 ```
-Huawei API ──► (consumer v2) ──► Influx NEO_LIVE ──► neo-model ingest ──► ts.*  (L1)
-                                                                      │
-pr_live_neodb (PR config) ──► neo-model asset sync ──► asset.*        ├──► calc.compute_intervals() ──► calc.pr_interval (L2)
-                                                                      └──► calc.compute_daily()     ──► calc.pr_daily    (L2)
-                                                     Timescale jobs ──► rpt.* continuous aggregates (L3); compression
-```
+
+Today the L1 ingest reads Influx (interim). The target replaces it with the consumer writing L0 directly (docs/PIPELINE.md).
 
 ## 3. Tables and views
 

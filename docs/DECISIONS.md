@@ -18,3 +18,7 @@
 | M14 | 2026-11-22 | Huawei only, no other vendors for now; the vendor is a column (`device.vendor`) so others can be added | scope |
 | M15 | 2026-11-22 | The model's service runs in `iotonix-neo` with a NetworkPolicy (namespace + DNS only) | it must never reach the customer servers |
 | M16 | 2026-11-22 | The old PR code (`iox.neoclean.performance_ratio.management`) is not changed and gets no new repository; it runs as-is (image 0.2) next to the model until the redesign replaces it | user decision |
+| M17 | 2026-11-22 | **Two pipelines during the transition:** A (Influx + PR as-is + Grafana, frozen) and B (Postgres layers + modules + API), both fed by the same consumer fetch | no second consumer on the quota-limited accounts; one-to-one comparison until the cut-over |
+| M18 | 2026-11-22 | **Mongo is eliminated:** the API cache becomes `raw.api_response` (JSONB, 31-day retention), master data and state go to `src.*` | one database less; the cache is the L0 of pipeline B, and retention is automatic instead of a manual prune |
+| M19 | 2026-11-22 | **Everything from L1 up is a module** with a fixed contract (inputs, outputs, version, grain, lookback, idempotent compute); orchestration by dirty windows | a new method, simulation or extrapolation changes one module, not the pipeline |
+| M20 | 2026-11-22 | The app reads only `api_v1` (versioned views), never the calculation tables | calculations can change without breaking the app |

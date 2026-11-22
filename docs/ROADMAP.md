@@ -4,10 +4,13 @@ Target of the redesign: ~2026-12-01. Status: v2 runs (docs/OPERATIONS.md), `neo_
 
 ## Next
 
+The phases P1–P6 of the migration to pipeline B are in [PIPELINE.md §5](PIPELINE.md#5-migration-plan). The items below follow them.
+
 | # | Item | Notes |
 |---|---|---|
 | R1 | **API for the new dashboard app** (replaces Grafana and the endpoints in `/data/neo/NEO_APP_API_INVENTORY.md`) | read-only, over `rpt.*` and `calc.*`; a role `neo_api` with SELECT on `rpt`, `calc`, `asset`, `dq` |
-| R2 | **L0: the Huawei consumer writes `raw.api_response` directly**, and the model's ingest reads L0 instead of Influx | removes Influx and the Mongo cache from the path; keeps the API responses for re-processing |
+| R2 | **L0: the Huawei consumer writes `raw.api_response` directly** (PostgresSink), the module `l1_huawei` reads L0, Mongo is dropped | PIPELINE.md P1–P3 |
+| R2b | Module framework (`meta.module`, dirty windows), PR split into modules | PIPELINE.md P4 |
 | R3 | Station and daily KPIs into L1 (`GetStationRealKpi`, `GetStationHourKpi`, `GetKpiStationDay`, `GetDevKpiDay_1`) and alarms | needed for the app's overview pages and for checking our energy against Huawei's |
 | R4 | Master-data fixes at the source (docs/DATA_QUALITY.md Q1–Q6, Q9) | owner: NEOVision; the asset sync takes them over with history |
 | R5 | Own asset maintenance | today the PR configuration (`pr_live_neodb`) is the master; later the model's `asset` schema becomes the master and the PR configuration UI writes to it |

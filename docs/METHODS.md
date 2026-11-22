@@ -1,13 +1,16 @@
 # PR methods
 
-Two families are computed side by side, each with a `method` name and a `version` (today `v2`) on every L2 row:
+Two families are computed side by side, each with a `method` name and a `version` on every L2 row. Current versions
+(registry `meta.module`; published to the app in `meta.api_published`): **`iec_61724_1` v3, `neo_customer` v2.**
 
 | `method` | What | Levels |
 |---|---|---|
 | `iec_61724_1` | performance ratio as IEC 61724-1 defines it, plus the temperature-corrected PR | interval (inverter, plant), day (plant, inverter, string) |
 | `neo_customer` | NEOVision's method, as implemented by PR as-is 0.2 (`iox.neoclean.performance_ratio.management`); reproduced exactly, bugs included where they are part of the numbers the customer sees (§4) | interval (inverter, plant), day (plant, inverter); instantaneous string PR as a view |
 
-Implementation: `sql/migrations/005_calc_functions.sql` (`calc.compute_intervals`, `calc.compute_daily`, view `calc.string_pr_instant`).
+Implementation: one module per method and grain (`sql/migrations/012_modules.sql`, `014_pr_iec_v3.sql`): `calc.m_pr_iec_interval`,
+`calc.m_pr_iec_daily_v3`, `calc.m_pr_customer_interval`, `calc.m_pr_customer_daily`; shared inputs `calc.prepare_pr_inputs`;
+view `calc.string_pr_instant`.
 The analysis of the old code is in `/data/neo/PR_FORMULAS.md` (outside this repository).
 
 ## 1. Common building blocks
@@ -41,11 +44,18 @@ selection, `plant_devices`). The other devices are still ingested to L1.
 | PR | Y_f / Y_r, NULL when H = 0 | `pr` |
 | Temperature factor | C_k = 1 + γ · (T_mod − 25 °C) / 100 (γ in %/°C, negative) | `c_k` |
 | Temperature-corrected PR | Y_f / (Y_r · C_k) | `pr_temp_corrected` |
-| Daily PR (plant, inverter) | Σ Y_f / Σ Y_r over the intervals with Y_r > 0 of the **local** day (00:00–24:00 Bangkok) | `calc.pr_daily.pr` |
-| Daily temperature-corrected PR | Σ Y_f / Σ (Y_r · C_k) | `pr_temp_corrected` |
+| Daily PR (plant, inverter) | Σ Y_f / Σ Y_r over **all** intervals of the **local** day (00:00–24:00 Bangkok) with both values present (v3; v2 summed only intervals with Y_r > 0, see below) | `calc.pr_daily.pr` |
+| Daily temperature-corrected PR | Σ Y_f / Σ (Y_r · C_k) over the intervals with C_k | `pr_temp_corrected` |
 | Daily string PR (DC) | (Σ P_dc · Δt / P0_string) / (H_POA,day / G_ref); Δt = time to the next sample, at most 30 min; DC side, so inverter losses are not included | `pr_daily` level `string` |
 
 The plant level sums energy and P0 over the primary inverters of a slot; γ is P0-weighted.
+
+**v3 (2026-11-22) vs v2:** the EMI's cumulative irradiation counter has a coarse resolution, so on dull days many 5-minute intervals
+show H = 0 while the inverters produce. v2 left those intervals out of the daily sums, which dropped their energy but no irradiation,
+so the daily PR came out too low (NE=51345970 on 2026-11-21: v2 0.608, v3 0.678; 30-day plant means rose by up to 0.14). v3 sums
+all intervals, as IEC 61724-1 defines the period PR. The interval values are the same in both versions.
+
+**Missing values:** the IEC method uses NULL as missing (an interval with a missing counter has no energy and is left out).
 Not yet implemented from the standard: availability-based exclusions (IEC lets you exclude documented unavailability symmetrically from E and H),
 the annual-temperature-equivalent PR (T_ref = the annual mean instead of 25 °C), and the uncertainty classes.
 
@@ -65,6 +75,11 @@ the annual-temperature-equivalent PR (T_ref = the annual mean instead of 25 °C)
 | PR actual CK / TCF | PR_xze / CK, PR_xze · TCF (0 if the divisor or PR_xze is 0) | `pr_ck`, `pr_tcf` (`pr_actual_ck`, `pr_actual_tcf`) |
 
 No customer row is written for a month without a month factor (T_ref), as in PR as-is.
+
+**Input convention (as-is):** PR as-is read its inputs from Influx, where the consumer stored a value the API delivered as null as 0.0.
+The customer module applies the same rule to its inputs (`calc.prepare_pr_inputs(…, asis => true)`: missing counter, state,
+meter power and module temperature count as 0), so its numbers stay those of the old system although L1 now keeps NULL.
+One effect: when an inverter's `day_cap` is missing for one sample, the next interval gets the whole day's energy (as in the old system).
 `power_limited` (any inverter in state 513) is recorded but does not exclude (as in the old code).
 
 ### 3.2 Interval (plant): `GetStationRealKpi` fields
@@ -106,7 +121,11 @@ sensor's first sample in the same 5-minute slot. `pr_iec` is the same without th
 
 ## 5. Adding or changing a method
 
-1. Never change the numbers of an existing `(method, version)` silently. New logic → a new `version` (env `CALC_VERSION`) or a new `method`.
-2. Write the change as a new migration (`sql/migrations/NNN_*.sql`, `CREATE OR REPLACE FUNCTION`), document it here, and validate it
-   (docs/VALIDATION.md).
-3. Recompute history by calling the functions for the period (docs/OPERATIONS.md §5). Old versions stay until deleted on purpose.
+1. Never change the numbers of an existing `(method, version)`. New logic → a new module version: a new entry function (e.g.
+   `calc.m_pr_iec_daily_v3`), a new migration that updates `meta.module` (version, entrypoint) and marks the history dirty
+   (`meta.backfill` or an `INSERT INTO meta.dirty_window`). If a daily module changes, bump its interval module's version too (the daily
+   module reads the interval rows of its own version). Example: `014_pr_iec_v3.sql`.
+2. The service backfills the new version next to the old one in the background (30 days of one method: about 1 minute).
+3. Compare (`tests/validate.sql -v version=…` for the customer method; your own checks for others), document here.
+4. Publish: `UPDATE meta.api_published SET version = … WHERE method = …` (in a migration). The app switches without a change.
+5. Old versions stay until deleted on purpose.

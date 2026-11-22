@@ -9,7 +9,7 @@ same raw data (also from `PR_RESTORE`), so both sides see the same inputs.
 ```bash
 # 1. a test database with the migrations (docs/OPERATIONS.md §4), e.g. neo_model_test
 # 2. the service once, on PR_RESTORE, for the reference week (local dates):
-PG_DB=neo_model_test PG_ASSET_DB=pr_neodb INFLUX_DB=PR_RESTORE BACKFILL_FROM=2026-11-05 BACKFILL_TO=2026-11-12 ONCE=1 \
+PG_DB=neo_model_test PG_ASSET_DB=pr_neodb L1_SOURCE=influx INFLUX_DB=PR_RESTORE BACKFILL_FROM=2026-11-05 BACKFILL_TO=2026-11-12 ONCE=1 \
   PG_HOST=10.0.0.180 PG_PORT=20019 PG_USER=neo_owner PG_PASSWORD=… INFLUX_HOST=10.0.0.180 INFLUX_PORT=20018 INFLUX_USER=… INFLUX_PASSWORD=… \
   python service/neo_model.py
 # 3. neo-dev's results into schema ref (same env):
@@ -45,6 +45,32 @@ old system lacks ÷100 (B1).
 
 ## 3. IEC method
 
-`iec_61724_1` has no reference implementation here. Checks done: Y_f, Y_r and PR by hand for single intervals; the daily PR equals Σ Y_f / Σ Y_r;
+`iec_61724_1` has no reference implementation here. Checks done: Y_f, Y_r and PR by hand for single intervals; the daily PR equals Σ Y_f / Σ Y_r (v3: over all intervals, METHODS.md §2); IEC v3 plant means over 30 days are within 1–3 % of the customer PR, which uses the GlobInc factor and the customer day;
 string-level PR medians are plausible (PTTOR-SL-TR on 2026-11-10: median 0.832, p10/p90 0.781/0.875). An external check (e.g. against PVsyst
 or the Huawei FusionSolar PR) is on the roadmap.
+
+## 4. L1 from L0 vs. L1 from Influx (P2, 2026-11-22)
+
+`tests/compare_l1_sources.sql` compares, field by field, L1 as `l1_huawei` derives it from L0 with L1 as it was loaded from Influx, for
+every device sample of an L0 window. First realtime run with both paths (11:30 UTC):
+
+| Table | Samples in both | Only in L0 | Only in Influx | Equal | L0 null, Influx 0 | Different |
+|---|---:|---:|---:|---:|---:|---:|
+| inverter_ac (7 fields) | 680 | 0 | 0 | 628 | 52 | **0** |
+| irradiance (3 fields) | 47 | 0 | 0 | 45 | 2 | **0** |
+| grid_meter (3 fields) | 40 | 0 | 0 | 40 | 0 | **0** |
+| dc_string | 5,427 | 0 | 204 | 5,427 | – | **0** |
+
+The only differences are values the API delivers as null: the consumer's Influx writer stores them as 0.0, L1 from L0 keeps NULL (the
+204 DC samples only in Influx are such inputs). Station KPIs: hourly values identical to Influx `GetStationHourKpi` (spot check).
+
+```bash
+psql … -d neo_model -v from="'2026-11-22 11:28'" -v to="'2026-11-22 11:34'" -f tests/compare_l1_sources.sql
+```
+
+## 5. Module refactor (P4, 2026-11-22)
+
+The PR functions were split into modules (`012`). Proof on the reference week in `neo_model_test`: the module functions computed as
+version `v2m` against the validated `v2`: **all 565,980 interval rows identical in every field** (both methods, inverter and plant
+level), customer daily identical, IEC daily equal to the 15th digit (summation order). `tests/validate.sql` after the refactor gives the
+same table as §2. The orchestrator was then tested end to end (backfill → interval modules → daily modules through the dirty windows).

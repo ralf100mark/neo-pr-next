@@ -75,7 +75,7 @@ Rules that hold for every stage:
 | Mongo today (consumer v2) | Role | Pipeline B |
 |---|---|---|
 | `GetDevRealKpi_1/_10/_17`, `GetStationRealKpi`, `GetStationHourKpi(RAW)` | API response cache (~136 k docs/day, pruned to 30 days by hand) | `raw.api_response` (JSONB, retention 31 days, automatic) |
-| `GetKpiStationDay`, `GetDevKpiDay_1` (kept forever on prod) | daily KPIs | L1 `ts.station_day`, `ts.device_day` (forever); raw 31 days |
+| `GetKpiStationDay`, `GetDevKpiDay_1` (kept forever on prod) | daily KPIs | L1 `ts.station_period` (period `day`), `ts.device_day` (forever); raw 31 days |
 | `Stations`, `GetDevList` | master data that the consumer **reads back** to know what to fetch | `src.station`, `src.device`; the consumer's getters read from Postgres |
 | `talegur.lastSensorValueUpdate` | last update per sensor | `src.sync_state` |
 | `GetAlarmList` (raw), `NotificationHistory`, consolidated alarm list | alarm intake and notification state | raw → L0; notification state → `src.alarm_notification`. **The alarms themselves are already in Postgres:** the consumer keeps `"GetAlarmListFlattened"` in `neo_live_iox` (insert new, set `clearedTime`), and the app reads it (`alarms-pg`); this stays as it is until the app redesign moves it into `src.alarm` |
@@ -89,8 +89,8 @@ The consumer's Mongo access sits in a few places: `database/mongo/getters.py`, o
 | Job | When | Endpoint(s) | L1 target |
 |---|---|---|---|
 | `realtime` | every 5 min, 05:00–18:55, plus 19:00 | `getDevRealKpi` (inverter 1, EMI 10, meter 17), `getStationRealKpi` | `ts.inverter_ac`, `ts.dc_string`, `ts.irradiance`, `ts.grid_meter`, `ts.station_real` |
-| `hour` | :37, 07–21 h | `getKpiStationHour` | `ts.station_hour` |
-| `daily` | 19:30 | `getDevKpiDay`, `getKpiStationDay` | `ts.device_day`, `ts.station_day` |
+| `hour` | :37, 07–21 h | `getKpiStationHour` | `ts.station_period` (period `hour`) |
+| `daily` | 19:30 | `getDevKpiDay`, `getKpiStationDay` | `ts.device_day`, `ts.station_period` (period `day`) |
 | `alarm` | every 30 min | `getAlarmList` | `neo_live_iox."GetAlarmListFlattened"` (today) → `src.alarm` (with the app redesign) |
 | `sync_stations` / `sync_devices` | 19:45 / 19:47 | `stations`, `getDevList` | `src.station`, `src.device` → `asset_sync` |
 | `auth` | 3×/h | `login` | – |
@@ -150,55 +150,45 @@ flowchart LR
 | A second vendor | new L1 normaliser `l1_<vendor>` from its own L0 endpoint rows | L2 modules (they read physical L1 tables, not vendor data) |
 | New app page | new `rpt` mart or `api_v1` view | calculations |
 
-### 3.4 Modules (status)
+### 3.4 Modules (status 2026-11-22)
 
-| Module | Layer | Status |
+The registry is `meta.module`; this table mirrors it.
+
+| Module | Version | Layer | Entry point | Status |
+|---|---|---|---|---|
+| `asset_sync` (PR configuration → `asset.*`, validity history) | v2 | L1 | Python (`sync_assets`) | ✅ every 6 h |
+| `l1_huawei` (L0 → `ts.*`: devices, stations, daily KPIs) | v2 | L1 | `l1.load_huawei` | ✅ **active** (`L1_SOURCE=l0`) |
+| `l1_influx` (Influx `NEO_LIVE` → `ts.*`) | v2 | L1 | Python (`ingest`) | fallback, disabled (`L1_SOURCE=influx`) |
+| `pr_iec_61724_1.interval` | v3 | L2 | `calc.m_pr_iec_interval` | ✅ |
+| `pr_iec_61724_1.daily` (plant, inverter, string) | v3 | L2 | `calc.m_pr_iec_daily_v3` | ✅ published |
+| `pr_neo_customer.interval` (xze, CK/TCF) | v2 | L2 | `calc.m_pr_customer_interval` | ✅ validated |
+| `pr_neo_customer.daily` (customer day, EPC) | v2 | L2 | `calc.m_pr_customer_daily` | ✅ validated, published |
+| `string_pr_instant` | – | L2 | view `calc.string_pr_instant` | ✅ (computed on read) |
+| `availability`, `energy_loss`, `expected_power`, `simulation`, `estimate` | – | L2 | – | ⬜ (add as modules, §3.3) |
+| `rpt.*` aggregates, `api_v1` | – | L3 | Timescale jobs, views | ✅ |
+
+## 4. L0 and src (migration `010_l0_src.sql`)
+
+| Table | Content | Written by |
 |---|---|---|
-| `asset_sync` (PR configuration → `asset.*`, SCD history) | L1 | ✅ (inside `neo_model.py`) |
-| `l1_influx` (Influx `NEO_LIVE` → `ts.*`) | L1 | 🟡 interim, replaced by `l1_huawei` |
-| `l1_huawei` (L0 JSONB → `ts.*`) | L1 | ⬜ |
-| `pr_iec_61724_1` (interval + daily, inverter/plant/string) | L2 | ✅ (in `calc.compute_intervals` / `compute_daily`, to be split per module) |
-| `pr_neo_customer` (xze, CK/TCF, daily, EPC) | L2 | ✅ validated (same functions) |
-| `string_pr_instant` | L2 | ✅ view |
-| `availability`, `energy_loss`, `expected_power`, `simulation`, `estimate` | L2 | ⬜ |
-| `rpt.*` aggregates, `api_v1` | L3 | ✅ `rpt` / ⬜ `api_v1` |
+| `raw.api_response` | one row per API response: `fetched_at`, `account`, `endpoint`, `dev_type_id`, `collect_time`, `request` (JSONB), `http_status`, `fail_code`, `success`, `response` (JSONB, unchanged; `response_text` when not JSON), `elapsed_ms`. Hypertable, 1-day chunks, compressed after 3 days, **dropped after 31 days** | consumer (`make_api_request` → `pg_store.record_api_response`), role `neo_ingest` (INSERT only) |
+| `src.station`, `src.device` | master data as delivered (`doc` = the API document + `account`), `active` = in the account's last full sync, first/last seen | consumer (`Stations`, `GetDevList` fetchers) |
+| `src.sync_state` | last value per sensor and kind (`device_real`, `station_real`, `station_hour`) | consumer |
+| `src.alarm_notification` | last notification per station and alarm | consumer (`GetAlarmList`) |
 
-## 4. L0 design (sketch for P1)
+Size: one realtime run (863 devices + 43 stations) is about 170 kB in L0 after TOAST compression, about 25 MB per day before
+Timescale compression. Login requests do not go through `make_api_request`, so no credentials reach L0.
 
-```sql
-CREATE TABLE raw.api_response (                 -- hypertable on fetched_at, 1-day chunks
-    raw_id       bigint GENERATED ALWAYS AS IDENTITY,
-    fetched_at   timestamptz NOT NULL,           -- when we received it
-    source       text NOT NULL DEFAULT 'huawei',
-    account      text NOT NULL,                  -- Huawei user (quota owner)
-    endpoint     text NOT NULL,                  -- e.g. getDevRealKpi
-    dev_type_id  smallint,                       -- 1, 10, 17 … where the endpoint has one
-    collect_time timestamptz,                    -- the time the data is for (day KPIs), if any
-    request      jsonb NOT NULL,                 -- parameters sent (devIds, stationCodes, collectTime)
-    http_status  smallint,
-    fail_code    integer,                        -- Huawei failCode (0 = ok, 407 = quota …)
-    response     jsonb,                          -- the body, unchanged
-    job          text,                           -- scheduler job (realtime, hour, daily …)
-    PRIMARY KEY (raw_id, fetched_at)
-);
-SELECT add_retention_policy('raw.api_response', INTERVAL '31 days');
-SELECT add_compression_policy('raw.api_response', INTERVAL '3 days');
-```
+## 5. Migration plan and status
 
-Migration `003` already created a minimal `raw.api_response` (no writer yet). `010` brings it to this shape and adds the retention policy.
+| Phase | Step | Done when | Status (2026-11-22) |
+|---|---|---|---|
+| **P1** | Consumer: `pg_store` writes L0 + `src.*` (hook in `make_api_request`); migration `010` | every API call is in `raw.api_response` | ✅ consumer 2.1.0 (`d3d3afa`, F16) since 11:28 UTC; Influx writes unchanged (749 points / 5 min) |
+| **P2** | Module `l1_huawei` (L0 → L1) | L1 from L0 = L1 from Influx | ✅ `tests/compare_l1_sources.sql`: every sample equal except values the API sends as null (Influx stored them as 0, L1 keeps NULL); `neo_model` switched to `l1_huawei` at 11:39 UTC. Station/daily KPIs added (`017`), hourly values identical to Influx |
+| **P3** | Consumer reads master data and state from `src.*`; **Mongo off** | consumer runs without a Mongo connection | ✅ `MONGO_ENABLED=false` since 11:28 UTC; master data copied and compared (`tools/bootstrap_src_from_mongo.py`: 43 stations, all device types equal). `NeoLive`/`talegurLive` are no longer written; drop them after 2026-12-06 |
+| **P4** | Module framework: `meta.module`, `meta.dirty_window`, orchestrator; PR split into modules (`012`) | adding a module needs no change to the service | ✅ neo-model 0.3; refactor proven exact (all interval values bit-identical, `tests/validate.sql` unchanged); first use: IEC v3 (`014`) |
+| **P5** | `api_v1` (`013`, `015`, `017`) + API service | the app reads only `api_v1` | ✅ PostgREST `neo-api`, `http://10.0.0.180:20021`, read-only; 20 endpoints (plants, devices, strings, power, energy, irradiation, PR, string health, station KPIs, data quality, pipeline status). Not covered: users/auth, alarms (still `neo_live_iox`), Strapi content |
+| **P6** | Cut-over: Influx sink off, PR as-is pod and Grafana retired | customer sign-off of the PR numbers from pipeline B | ⬜ needs the new app and the customer's sign-off |
 
-One row per API call (not per device): what Huawei sent, exactly, in one place. The size is about 300 calls per day per account and
-endpoint; the 30 days in Mongo `NeoLive` are about 2 GB, and compressed JSONB is in the same range. `l1_huawei` reads new rows by `raw_id`.
-
-## 5. Migration plan
-
-| Phase | Step | Done when |
-|---|---|---|
-| **P1** | Consumer: sink interface; `PostgresSink` writes L0 + `src.*` **in addition** (Influx and Mongo unchanged); migration `010_l0_src.sql` | every API call is in `raw.api_response`; counts per job = consumer log |
-| **P2** | Module `l1_huawei` (L0 → L1), run next to `l1_influx` into a test database | one week of L1 identical (counts and values) from both paths; then switch `neo_model` to `l1_huawei` |
-| **P3** | Consumer reads master data and state from `src.*`; notification state to `src.alarm_notification`; **Mongo writes off**; drop `NeoLive`/`talegurLive` after 2 weeks | consumer runs without a Mongo connection |
-| **P4** | Module framework: `meta.module`, `meta.dirty_window`, orchestrator; split the PR functions into modules | adding a module needs no change to the service |
-| **P5** | `api_v1` + API service (read-only role); the new app reads only `api_v1` | the app pages of `NEO_APP_API_INVENTORY.md` are covered |
-| **P6** | Cut-over: Influx sink off, PR as-is pod and Grafana retired | customer sign-off of the PR numbers from pipeline B |
-
-Pipeline A keeps running unchanged until P6. Until then, every phase can be rolled back by switching a sink or a module off.
+Pipeline A keeps running unchanged until P6. Every phase can be rolled back by switching a flag: `MONGO_ENABLED=true` (consumer),
+`L1_SOURCE=influx` (model service), `meta.api_published` (which version the app sees).

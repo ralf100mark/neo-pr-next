@@ -7,9 +7,9 @@ It runs on PostgreSQL 18 + TimescaleDB 2.31.
 
 | | |
 |---|---|
-| **Status** | v2 in production (Kubernetes `iotonix-neo/neo-model`, since 2026-11-22). The customer method is validated against the old system: 100 % of the 5-minute values match |
+| **Status** | **Pipeline B runs end to end** (2026-11-22): the consumer writes L0 to Postgres (no Mongo), `neo-model` 0.3 builds L1 and runs the PR modules, `neo-api` serves `api_v1` at `http://10.0.0.180:20021`. The customer method is validated against the old system: 100 % of the 5-minute values match |
 | **Scope** | 49 plants, 1,066 devices, 2,881 strings; PR for the 13 plants with a PR configuration |
-| **Target** | redesign ready ~2026-12-01: pipeline B (below) end to end, Grafana and Mongo retired |
+| **Next** | the new dashboard app on `api_v1`, then the cut-over (Influx, PR as-is and Grafana retired); see [ROADMAP](docs/ROADMAP.md) |
 
 ---
 
@@ -55,11 +55,11 @@ Full description, module contract and migration plan: **[docs/PIPELINE.md](docs/
 ## Repository layout
 
 ```
-sql/migrations/    numbered DDL (001 base … 009 compat); applied once each by sql/migrate.sh
-service/           neo-model service: asset sync, L1 ingest, module runs (Python 3.11, Dockerfile)
-tests/             validate.sql: field-by-field comparison with the old system
+sql/migrations/    numbered DDL 001…017 (base, asset, L1, calc, rpt, dq, compat, L0/src, l1 loader, modules, api_v1 …); sql/migrate.sh
+service/           neo-model service: asset sync, L1 load, module orchestrator (Python 3.11, Dockerfile)
+tests/             validate.sql (customer method vs. the old system), compare_l1_sources.sql (L1 from L0 vs. from Influx)
 tools/             load_reference.py: loads the old system's results as the reference
-deploy/            copy of the Kubernetes manifest (source of truth: rad_argocd tenants/neo/neo-model.yaml)
+deploy/            copies of the Kubernetes manifests neo-model.yaml, api.yaml (source of truth: rad_argocd tenants/neo/)
 docs/              the documentation (below)
 ```
 
@@ -87,6 +87,13 @@ PGHOST=… PGPORT=… PGUSER=neo_owner PGPASSWORD=… PGDATABASE=neo_model sql/m
 # one service cycle by hand (configuration by environment, see docs/OPERATIONS.md §2)
 pip install -r service/requirements.txt
 ONCE=1 PG_HOST=… PG_USER=… PG_PASSWORD=… INFLUX_HOST=… INFLUX_USER=… INFLUX_PASSWORD=… python service/neo_model.py
+```
+
+```bash
+# the read API (PostgREST; filters: column=eq.value, gte., lt., in.(…); select=…; order=…)
+curl 'http://10.0.0.180:20021/pr_daily?level=eq.plant&day=eq.2026-11-21&select=plant_code,method,version,pr,pr_xze'
+curl 'http://10.0.0.180:20021/plant_power_5min?plant_code=eq.NE=51345970&slot=gte.2026-11-22T00:00:00Z'
+curl 'http://10.0.0.180:20021/'                      # OpenAPI description of every endpoint
 ```
 
 ```sql

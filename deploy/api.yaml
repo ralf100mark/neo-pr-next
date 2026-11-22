@@ -1,0 +1,81 @@
+# COPY for reference. The source of truth is /opt/argocd/tenants/neo/api.yaml (repo AIT-AI/rad_argocd, Argo CD app iotonix-neo).
+# NEO read API (pipeline B, stage S5; repo ralf100mark/neo-pr-next, docs/PIPELINE.md + OPERATIONS.md): PostgREST over the schema
+# api_v1 of neo_model, read-only (role neo_api_auth -> neo_api: SELECT on api_v1 only). The dashboard app reads only this.
+# http://10.0.0.180:20021/<view>?plant_code=eq.NE=51345970&day=gte.2026-11-01 ; OpenAPI at /. Config: SealedSecret neo-api-env
+# (PGRST_DB_URI). NetworkPolicy api-egress: this namespace + DNS only. Ralf 2026-11-22.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: neo-api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: neo-api
+  template:
+    metadata:
+      labels:
+        app: neo-api
+        neo/part-of: api
+    spec:
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        runAsNonRoot: true
+      containers:
+        - name: postgrest
+          image: registry.ait.co.th/iotonix/infra/postgrest:v12.2.3@sha256:d8043b922dafbd8e305deb2a04614e4e941a4300ec3df62ceb87c1bc1e1ce652
+          envFrom:
+            - secretRef:
+                name: neo-api-env
+          env:
+            - { name: PGRST_DB_SCHEMAS, value: api_v1 }
+            - { name: PGRST_DB_ANON_ROLE, value: neo_api }
+            - { name: PGRST_DB_MAX_ROWS, value: "100000" }       # hard cap per response
+            - { name: PGRST_DB_POOL, value: "10" }
+            - { name: PGRST_SERVER_PORT, value: "3000" }
+            - { name: PGRST_ADMIN_SERVER_PORT, value: "3001" }   # /live, /ready
+            - { name: PGRST_OPENAPI_MODE, value: follow-privileges }
+            - { name: PGRST_LOG_LEVEL, value: error }
+          ports:
+            - { name: http, containerPort: 3000 }
+            - { name: admin, containerPort: 3001 }
+          readinessProbe:
+            httpGet: { path: /ready, port: 3001 }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /live, port: 3001 }
+            periodSeconds: 20
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { memory: 512Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: neo-api
+spec:
+  selector:
+    app: neo-api
+  ports:
+    - { name: http, port: 3000, targetPort: 3000 }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: api-egress
+spec:
+  podSelector:
+    matchLabels:
+      neo/part-of: api
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector: {}
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }

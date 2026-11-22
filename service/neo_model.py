@@ -1,14 +1,18 @@
-"""NEO data model service: keeps the Timescale model (database PG_DB) current. Specification: docs/OPERATIONS.md.
+"""NEO data model service: keeps the Timescale model (database PG_DB) current. Specification: docs/OPERATIONS.md, docs/PIPELINE.md.
 
 Every CYCLE_S seconds (at OFFSET_S after the 5-minute boundary):
-  1. assets     sync from the PR configuration database (PG_ASSET_DB) at start and every ASSET_SYNC_H hours; a changed
-                string configuration closes the current asset.pv_string row and opens a new one (validity ranges)
-  2. ingest     L1 from InfluxDB (INFLUX_DB): inverter AC + DC strings, irradiance, grid meter, since the watermark
-  3. intervals  L2 calc.compute_intervals() for the last PR_LOOKBACK_H hours (iec_61724_1 + neo_customer)
-  4. daily      L2 calc.compute_daily() for today and yesterday (local days)
+  1. asset_sync  from the PR configuration database (PG_ASSET_DB) at start and every ASSET_SYNC_H hours; a changed string
+                 configuration closes the current asset.pv_string row and opens a new one (validity ranges)
+  2. L1          L1_SOURCE=l0:     module l1_huawei, SQL l1.load_huawei() over the L0 responses since its watermark
+                 L1_SOURCE=influx: module l1_influx, the interim ingest from InfluxDB (INFLUX_DB)
+                 The data time range loaded is marked dirty for every module that depends on 'l1'.
+  3. modules     the orchestrator runs the enabled L2 modules of meta.module in dependency order on their dirty windows
+                 (meta.dirty_window), widened by the module's lookback and aligned to its grain; on success the windows are
+                 cleared and the module's dependents are marked dirty. A failed module keeps its windows and blocks only
+                 its dependents.
 
-First start (no watermark): backfill BACKFILL_DAYS days, or BACKFILL_FROM..BACKFILL_TO (ISO dates) if set.
-Reads only PG_ASSET_DB and InfluxDB; writes only PG_DB. A failed cycle is logged; the next one runs normally.
+First start (no L1 watermark): backfill BACKFILL_DAYS days, or BACKFILL_FROM..BACKFILL_TO (ISO dates) if set.
+Writes only PG_DB. A failed step is logged; the next cycle retries.
 """
 
 import io
@@ -26,7 +30,7 @@ import psycopg2
 import requests
 
 LOG = logging.getLogger("neo_model")
-VERSION = os.environ.get("CALC_VERSION", "v2")
+SERVICE_VERSION = "0.3.1"
 LOCAL_TZ = ZoneInfo("Asia/Bangkok")
 KIND = {1: "inverter", 10: "irradiance_sensor", 17: "grid_meter", 63: "logger"}
 STRING_MIN_A = 1.0          # an unconfigured input becomes an (observed) string only above this current
@@ -49,6 +53,7 @@ CFG = dict(
     lookback_h=env("PR_LOOKBACK_H", "3", float), backfill_days=env("BACKFILL_DAYS", "30", int),
     backfill_from=os.environ.get("BACKFILL_FROM"), backfill_to=os.environ.get("BACKFILL_TO"),
     asset_sync_h=env("ASSET_SYNC_H", "6", float), overlap_min=env("INGEST_OVERLAP_MIN", "30", int),
+    l1_source=env("L1_SOURCE", "influx"), l0_settle_s=env("L0_SETTLE_S", "60", int),
 )
 
 
@@ -58,9 +63,9 @@ def pg(db):
     return c
 
 
-def start_run(cur, kind, method, params):
+def start_run(cur, kind, method, params, version=None):
     cur.execute("insert into calc.run (kind, method, version, params) values (%s,%s,%s,%s) returning run_id",
-                (kind, method, VERSION, json.dumps(params, default=str)))
+                (kind, method, version or SERVICE_VERSION, json.dumps(params, default=str)))
     return cur.fetchone()[0]
 
 
@@ -330,25 +335,141 @@ def ingest(since, until):
 
 # ----------------------------------------------------------------------------------------------- 3./4. calc (L2)
 
-def compute(since, until, day_from, day_to):
+def mark_l1(cur, t_from, t_to, reason):
+    """Data of L1 changed in [t_from, t_to): every module that reads L1 has to recompute it."""
+    if t_from is None or t_to is None or t_to <= t_from:
+        return 0
+    cur.execute("select meta.mark_dependents('l1', tstzrange(%s, %s), %s)", (t_from, t_to, reason))
+    return cur.fetchone()[0]
+
+
+def load_l1_influx(since, until):
+    ingest(since, until)
+    db = pg(CFG["db"]); cur = db.cursor()
+    mark_l1(cur, since, until, "l1_influx")
+    db.commit(); db.close()
+
+
+def load_l1_l0(first=False):
+    """Module l1_huawei: L0 responses fetched since the watermark (minus the module lookback), up to now - L0_SETTLE_S."""
+    db = pg(CFG["db"]); cur = db.cursor()
+    cur.execute("select version, lookback from meta.module where name = 'l1_huawei'")
+    version, lookback = cur.fetchone()
+    cur.execute("select until_ts from calc.watermark where job = 'l1_huawei'")
+    r = cur.fetchone()
+    if r:
+        since = r[0] - lookback
+    else:
+        cur.execute("select min(fetched_at) from raw.api_response")
+        since = cur.fetchone()[0]
+        if since is None:
+            LOG.info("l1_huawei: L0 is empty, nothing to load")
+            db.close()
+            return
+    until = datetime.now(timezone.utc) - timedelta(seconds=CFG["l0_settle_s"])
+    if until <= since:
+        db.close()
+        return
+    run_id = start_run(cur, "l1", "l1_huawei", {"from": since, "to": until}, version)
+    cur.execute("select l1.load_huawei(%s, %s, %s)", (since, until, run_id))
+    res = cur.fetchone()[0]
+    rows = sum(v for k, v in res.items() if k in ("inverter_ac", "dc_string", "irradiance", "grid_meter", "station_real",
+                                                    "station_period", "device_day"))
+    end_run(cur, run_id, rows)
+    t_min = datetime.fromisoformat(res["time_min"]) if res.get("time_min") else None
+    t_max = datetime.fromisoformat(res["time_max"]) + timedelta(seconds=1) if res.get("time_max") else None
+    mark_l1(cur, t_min, t_max, "l1_huawei")
+    cur.execute("""insert into calc.watermark values ('l1_huawei', %s, now())
+                   on conflict (job) do update set until_ts = excluded.until_ts, updated_at = now()""", (until,))
+    db.commit(); db.close()
+    LOG.info("l1_huawei: L0 fetched %s .. %s: %s new rows %s", since.isoformat(timespec="minutes"), until.isoformat(timespec="minutes"),
+             rows, {k: v for k, v in res.items() if not k.startswith("time_")})
+
+
+# ----------------------------------------------------------------------------------------------- 4. modules (L2)
+
+def topo_order(mods):
+    """Modules in dependency order (depends_on may name 'l1' or modules that are not in the list: ignored)."""
+    names = {m["name"] for m in mods}
+    done, order = set(), []
+    pending = list(mods)
+    while pending:
+        progressed = False
+        for m in list(pending):
+            if all(d in done or d not in names for d in m["depends_on"]):
+                order.append(m); done.add(m["name"]); pending.remove(m); progressed = True
+        if not progressed:
+            raise RuntimeError(f"dependency cycle among modules: {[m['name'] for m in pending]}")
+    return order
+
+
+def align(t_from, t_to, grain):
+    """Widen [t_from, t_to) to whole units of the module's grain (5-min slots, local days or UTC days)."""
+    if grain == "interval":
+        step = 300
+        f = datetime.fromtimestamp(t_from.timestamp() // step * step, timezone.utc)
+        e = datetime.fromtimestamp(-(-t_to.timestamp() // step) * step, timezone.utc)
+        return f, max(e, f + timedelta(seconds=step))
+    tz = LOCAL_TZ if grain == "day_local" else timezone.utc
+    d0 = t_from.astimezone(tz).date()
+    d1 = (t_to - timedelta(microseconds=1)).astimezone(tz).date() + timedelta(days=1)
+    return (datetime.combine(d0, datetime.min.time(), tz).astimezone(timezone.utc),
+            datetime.combine(d1, datetime.min.time(), tz).astimezone(timezone.utc))
+
+
+def chunks(t_from, t_to, step):
+    while t_from < t_to:
+        t1 = min(t_from + step, t_to)
+        yield t_from, t1
+        t_from = t1
+
+
+def run_modules():
+    """Run every enabled L2 module with an entrypoint on its dirty windows, in dependency order."""
     db = pg(CFG["db"]); cur = db.cursor()
     cur.execute("SET timescaledb.max_tuples_decompressed_per_dml_transaction = 0")   # recalculation may touch compressed chunks
-    run_id = start_run(cur, "intervals", "iec_61724_1+neo_customer", {"from": since, "to": until})
-    n_int, t0 = 0, since
-    while t0 < until:                       # one day per call keeps the temp tables small during a backfill
-        t1 = min(t0 + timedelta(days=1), until)
-        cur.execute("select calc.compute_intervals(%s, %s, %s, %s)", (t0, t1, VERSION, run_id))
-        n_int += cur.fetchone()[0]
+    cur.execute("""select name, version, entrypoint, grain, lookback, depends_on from meta.module
+                   where enabled and layer = 'L2' and entrypoint is not null""")
+    mods = [dict(zip(("name", "version", "entrypoint", "grain", "lookback", "depends_on"), r)) for r in cur.fetchall()]
+    db.commit()
+    failed = set()
+    for m in topo_order(mods):
+        if any(d in failed for d in m["depends_on"]):
+            LOG.warning("module %s skipped: a dependency failed in this cycle", m["name"])
+            failed.add(m["name"])
+            continue
+        cur.execute("select max(id) from meta.dirty_window where module = %s", (m["name"],))
+        top = cur.fetchone()[0]
+        if top is None:
+            db.commit()
+            continue
+        cur.execute("""select lower(r), upper(r) from (select unnest(range_agg(win)) r from meta.dirty_window
+                       where module = %s and id <= %s) x order by 1""", (m["name"], top))
+        wins = [align(lo - m["lookback"], hi, m["grain"]) for lo, hi in cur.fetchall()]
+        step = timedelta(days=1) if m["grain"] == "interval" else timedelta(days=7)
+        run_id = start_run(cur, m["name"], m["name"], {"windows": wins}, m["version"])
         db.commit()
-        t0 = t1
-    end_run(cur, run_id, n_int)
-    run_id = start_run(cur, "daily", "iec_61724_1+neo_customer", {"from": day_from, "to": day_to})
-    cur.execute("select calc.compute_daily(%s, %s, %s, %s)", (day_from, day_to, VERSION, run_id))
-    n_day = cur.fetchone()[0]
-    end_run(cur, run_id, n_day)
-    db.commit(); db.close()
-    LOG.info("calc %s: intervals from %s: %s rows, daily %s..%s: %s rows", VERSION, since.isoformat(timespec="minutes"), n_int,
-             day_from, day_to, n_day)
+        t0, n = time.time(), 0
+        try:
+            for lo, hi in wins:
+                for a, b in chunks(lo, hi, step):
+                    cur.execute(f"select {m['entrypoint']}(%s, %s, %s, %s)", (a, b, m["version"], run_id))
+                    n += cur.fetchone()[0] or 0
+                    db.commit()
+            cur.execute("delete from meta.dirty_window where module = %s and id <= %s", (m["name"], top))
+            for lo, hi in wins:
+                cur.execute("select meta.mark_dependents(%s, tstzrange(%s, %s), %s)", (m["name"], lo, hi, m["name"]))
+            end_run(cur, run_id, n)
+            db.commit()
+            LOG.info("module %s %s: %s window(s) %s, %s rows in %.1f s", m["name"], m["version"], len(wins),
+                     "; ".join(f"{a:%m-%d %H:%M}..{b:%m-%d %H:%M}" for a, b in wins), n, time.time() - t0)
+        except Exception:
+            db.rollback()
+            LOG.exception("module %s failed; its windows stay dirty", m["name"])
+            cur.execute("update calc.run set finished_at = now(), status = 'failed' where run_id = %s", (run_id,))
+            db.commit()
+            failed.add(m["name"])
+    db.close()
 
 
 # ----------------------------------------------------------------------------------------------- loop
@@ -360,26 +481,24 @@ def watermark(job):
     return r[0] if r else None
 
 
-def local_day(t):
-    return t.astimezone(LOCAL_TZ).date()
-
-
 def cycle():
     now = datetime.now(timezone.utc)
-    wm = watermark("ingest")
-    if wm is None:          # first start: backfill
-        if CFG["backfill_from"]:
-            since = datetime.combine(date.fromisoformat(CFG["backfill_from"]), datetime.min.time(), LOCAL_TZ).astimezone(timezone.utc)
-            until = (datetime.combine(date.fromisoformat(CFG["backfill_to"]) + timedelta(days=1), datetime.min.time(), LOCAL_TZ)
-                     .astimezone(timezone.utc) if CFG["backfill_to"] else now)
+    if CFG["l1_source"] == "l0":
+        load_l1_l0()
+    else:
+        wm = watermark("ingest")
+        if wm is None:          # first start: backfill
+            if CFG["backfill_from"]:
+                since = datetime.combine(date.fromisoformat(CFG["backfill_from"]), datetime.min.time(), LOCAL_TZ).astimezone(timezone.utc)
+                until = (datetime.combine(date.fromisoformat(CFG["backfill_to"]) + timedelta(days=1), datetime.min.time(), LOCAL_TZ)
+                         .astimezone(timezone.utc) if CFG["backfill_to"] else now)
+            else:
+                since, until = now - timedelta(days=CFG["backfill_days"]), now
+            LOG.info("first start: backfill %s .. %s", since.isoformat(timespec="minutes"), until.isoformat(timespec="minutes"))
+            load_l1_influx(since, until)
         else:
-            since, until = now - timedelta(days=CFG["backfill_days"]), now
-        LOG.info("first start: backfill %s .. %s", since.isoformat(timespec="minutes"), until.isoformat(timespec="minutes"))
-        ingest(since, until)
-        compute(since, until, local_day(since), local_day(until - timedelta(seconds=1)))
-        return
-    ingest(wm - timedelta(minutes=CFG["overlap_min"]), now)
-    compute(now - timedelta(hours=CFG["lookback_h"]), now, local_day(now) - timedelta(days=1), local_day(now))
+            load_l1_influx(wm - timedelta(minutes=CFG["overlap_min"]), now)
+    run_modules()
 
 
 def main():
@@ -392,8 +511,8 @@ def main():
         LOG.info("stopping after the current cycle")
     signal.signal(signal.SIGTERM, stop); signal.signal(signal.SIGINT, stop)
 
-    LOG.info("neo-model %s: db=%s assets=%s influx=%s/%s cycle=%ss", VERSION, CFG["db"], CFG["asset_db"], CFG["influx_url"],
-             CFG["influx_db"], CFG["cycle_s"])
+    LOG.info("neo-model %s: db=%s assets=%s L1 source=%s (influx %s/%s) cycle=%ss", SERVICE_VERSION, CFG["db"], CFG["asset_db"],
+             CFG["l1_source"], CFG["influx_url"], CFG["influx_db"], CFG["cycle_s"])
     last_assets = 0.0
     while not STOP:
         try:

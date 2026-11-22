@@ -11,6 +11,7 @@ The model does not fix master data. It shows what is wrong in the `dq` schema an
 | `dq.string_config` | Which strings are configured but dead, carry current but are not configured, or are disabled? (last 7 days) | `finding` ≠ `ok` |
 | `dq.silent_device` | Which devices delivered data before but nothing in the last day? | outages, comms |
 | `dq.pr_prerequisites` | Why does a plant get no customer PR? (primary EMI, primary meter, month factor, last month's IPZ, plant parameters) | before switching a plant to `pr_active` |
+| `dq.config_device_missing` | Which configured devices does the API no longer deliver, and what replaced them? | fix `plant_devices` in the PR configuration |
 | table `dq.unknown_sensor` | Which sensorIds arrive in the data but have no device? | missing device configuration |
 
 ```sql
@@ -19,6 +20,7 @@ SELECT finding, count(*) FROM dq.string_config GROUP BY 1;
 SELECT * FROM dq.string_config WHERE finding <> 'ok' ORDER BY plant_code, inverter, string_no;
 SELECT * FROM dq.pr_prerequisites WHERE pr_active AND NOT (month_factor_now AND ipz_previous_month AND plant_pr_param);
 SELECT measurement, count(*) FROM dq.unknown_sensor GROUP BY 1;
+SELECT * FROM dq.config_device_missing ORDER BY pr_active DESC, plant_code;
 ```
 
 ## 2. Findings (2026-11-22)
@@ -41,6 +43,9 @@ SELECT measurement, count(*) FROM dq.unknown_sensor GROUP BY 1;
 | Q13 | NE=64821350 and NE=78142560 have no import-power-zero value for last month | the xze threshold falls back to 0 kW (as in the old code): intervals with any meter power ≥ 0 are excluded | check `plant_import_power_history` |
 | Q14 | 2 grid meters went silent (NE=51128942 since 2026-11-06, NE=49768173 since 2026-11-13), both on plants outside PR | no meter data | site/comms check |
 
+| Q15 | **NE=78142560 (PRC) gets no PR at all:** the PR configuration names EMI 1000000078252784 and meter 1000000078142594; the API delivers the same EMI under the new devId 1000000100508270 and a different meter 1000000100484292 (`dq.config_device_missing`) | no irradiance and no meter data for the plant's PR, in the model and in PR as-is | update `plant_devices` (EMI and meter of NE=78142560) |
+| Q16 | 6 more plants (outside PR) have configured devices the API no longer delivers, mostly re-registered under new devIds (NE=50812759: 40 inverters) | none today (not `pr_active`); blocks PR for them later | update `plant_devices` before activating PR |
+| Q17 | History in L1 before 2026-11-22 11:39 UTC comes from Influx, where missing values are 0.0 (e.g. `day_cap` = 0 for one sample at dusk) | an IEC interval after such a sample gets the whole day's energy; the customer method reproduces the old behaviour on purpose | none needed for the customer numbers; IEC history could be cleaned by a correction module (ROADMAP) |
 Numbers Q3–Q5 are from 2026-11-20 midday (215 inverters of the 13 PR plants); `dq.string_config` gives the current state. On 2026-11-22 (last 7 days)
 it shows for the PR plants: 1,599 ok, 59 configured but no current, 24 current but not configured, 35 disabled. For the 36 plants outside
 PR, most strings are "current but not configured" (3,244), because the PR configuration has no strings for them.

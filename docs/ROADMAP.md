@@ -1,31 +1,33 @@
 # Roadmap
 
-Target of the redesign: ~2026-12-01. Status: v2 runs (docs/OPERATIONS.md), `neo_customer` validated (docs/VALIDATION.md).
+Target of the redesign: ~2026-12-01. Status 2026-11-22: pipeline B runs end to end (consumer → L0 → L1 → modules → `api_v1` → API),
+phases P1–P5 done (docs/PIPELINE.md §5). Pipeline A runs unchanged next to it.
 
 ## Next
 
-The phases P1–P6 of the migration to pipeline B are in [PIPELINE.md §5](PIPELINE.md#5-migration-plan). The items below follow them.
-
 | # | Item | Notes |
 |---|---|---|
-| R1 | **API for the new dashboard app** (replaces Grafana and the endpoints in `/data/neo/NEO_APP_API_INVENTORY.md`) | read-only, over `rpt.*` and `calc.*`; a role `neo_api` with SELECT on `rpt`, `calc`, `asset`, `dq` |
-| R2 | **L0: the Huawei consumer writes `raw.api_response` directly** (PostgresSink), the module `l1_huawei` reads L0, Mongo is dropped | PIPELINE.md P1–P3 |
-| R2b | Module framework (`meta.module`, dirty windows), PR split into modules | PIPELINE.md P4 |
-| R3 | Station and daily KPIs into L1 (`GetStationRealKpi`, `GetStationHourKpi`, `GetKpiStationDay`, `GetDevKpiDay_1`) and alarms | needed for the app's overview pages and for checking our energy against Huawei's |
-| R4 | Master-data fixes at the source (docs/DATA_QUALITY.md Q1–Q6, Q9) | owner: NEOVision; the asset sync takes them over with history |
-| R5 | Own asset maintenance | today the PR configuration (`pr_live_neodb`) is the master; later the model's `asset` schema becomes the master and the PR configuration UI writes to it |
-| R6 | History before 2026-10-23 | ingest from `NEO_RESTORE` (exact prod copy since 2024-04), then compute L2 for it |
+| R1 | **Cut-over (P6)**: the new app on `api_v1`, then Influx sink off, PR as-is pod and Grafana retired | needs the new app and the customer's sign-off of the PR numbers |
+| R2 | The new dashboard app reads `api_v1`; extend `api_v1` page by page (`NEO_APP_API_INVENTORY.md`) | not covered yet: users/auth (IOX user service), alarms (`neo_live_iox`), Strapi content, write operations |
+| R3 | Alarms into the model (`src.alarm` from L0 `getAlarmList`, an `api_v1.alarm` view) | today the consumer writes `neo_live_iox."GetAlarmListFlattened"`, which the old app reads |
+| R4 | Master-data fixes at the source (docs/DATA_QUALITY.md Q1–Q6, Q9, Q12, Q15, Q16) | owner: NEOVision; the asset sync takes them over with history |
+| R5 | Drop the Mongo databases `NeoLive` / `talegurLive` (not written since 2026-11-22 11:28) and the Mongo code in the consumer | after 2026-12-06 (two weeks of pipeline B) |
+| R6 | History before 2026-10-23 | from `NEO_RESTORE` (prod copy since 2024-04), OPERATIONS.md §5 |
+| R7 | Backups for `neo_model` (and the whole tenant) | tenant `ait` has `services/iotonix-tenant/backup`; NEO has none yet |
+| R8 | Own asset maintenance | today the PR configuration (`pr_live_neodb`) is the master; later `asset` becomes the master and the configuration UI writes to it |
 
 ## Later
 
 | # | Item | Notes |
 |---|---|---|
-| R7 | Physical data: tilt/azimuth per string, module datasheets (NOCT, area), string → MPPT, inverter AC rating | DATA_QUALITY Q10 |
-| R8 | Transposition (GHI → POA) for strings whose orientation differs from the sensor; expected power model (irradiance + temperature); clipping/curtailment detection | needs R7 |
-| R9 | IEC 61724-1 extras: documented-unavailability exclusions, annual-temperature-equivalent PR, availability KPIs, energy-loss breakdown (the old `energy_loss` curtailment estimate as its own method) | |
-| R10 | String diagnostics: persistent under-performers (`rpt.string_health_daily`), alerts | |
-| R11 | Simulations (the user's "physical model": what-if, degradation trends) | on top of R7/R8 |
-| R12 | Monitoring of the service (metrics, alert when the watermark lags) | |
-| R13 | External check of the IEC numbers (PVsyst, FusionSolar PR) | VALIDATION.md §3 |
-| R14 | Retire `compat.*` once the new app no longer needs the old field names | |
-| R15 | CI: run `sql/migrate.sh` and `tests/validate.sql` on a throw-away database per commit | |
+| R9 | Physical data: tilt/azimuth per string, module datasheets (NOCT, area), string → MPPT, inverter AC rating | DATA_QUALITY Q10 |
+| R10 | Modules: `expected_power` (irradiance + temperature model), transposition for strings whose orientation differs from the sensor, clipping/curtailment detection | needs R9 |
+| R11 | Modules: availability, energy-loss breakdown (incl. the old curtailment estimate), IEC exclusions for documented unavailability, annual-temperature-equivalent PR | each a module (PIPELINE.md §3.3) |
+| R12 | Module `simulation` (scenarios: other modules, tilt, cleaning interval) and `estimate` (gap fill, forecast; flagged as estimated) | PIPELINE.md §3.3 |
+| R13 | A correction module for the Influx-era L1 history (missing values stored as 0, Q17) | IEC history only |
+| R14 | String diagnostics: persistent under-performers (`api_v1.string_health_daily`), alerts | |
+| R15 | Monitoring and alerting on `api_v1.pipeline_status` (lag, failed runs) | |
+| R16 | External check of the IEC numbers (PVsyst, Huawei's own PR in `ts.station_period.pr_vendor_pct`) | VALIDATION.md §3 |
+| R17 | Retire `compat.*` and `calc.compute_intervals/compute_daily` once nothing uses them | |
+| R18 | CI: run `sql/migrate.sh`, `tests/validate.sql` and `tests/compare_l1_sources.sql` on a throw-away database per commit | |
+| R19 | A second vendor: its own L0 endpoint rows and an `l1_<vendor>` module; L2 modules stay unchanged | |

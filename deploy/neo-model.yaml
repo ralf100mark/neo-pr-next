@@ -1,0 +1,54 @@
+# COPY for reference. The source of truth is /opt/argocd/tenants/neo/neo-model.yaml (repo AIT-AI/rad_argocd, Argo CD app iotonix-neo).
+# NEO data model service v2 (/data/neo/model, docs/OPERATIONS.md): keeps the Timescale model database neo_model current every 5 min.
+# Reads the asset config (Postgres pr_live_neodb) and the live time series (Influx NEO_LIVE), writes only neo_model
+# (assets, L1 measurements, L2 PR per interval and day: iec_61724_1 + neo_customer). Config: SealedSecret neo-model-env.
+# NetworkPolicy model-egress: this namespace + DNS only. Recreate: one writer at a time. Ralf 2026-11-22.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: neo-model
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: neo-model
+  template:
+    metadata:
+      labels:
+        app: neo-model
+        neo/part-of: model
+    spec:
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+      containers:
+        - name: neo-model
+          image: registry.ait.co.th/iotonix/neo-model:0.2.0@sha256:8d524f86ec17a1d137cbdf4000b2b89855e8438e7a519ac4b864c67f45e65063
+          envFrom:
+            - secretRef:
+                name: neo-model-env
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { memory: 4Gi }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: model-egress
+spec:
+  podSelector:
+    matchLabels:
+      neo/part-of: model
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector: {}
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
